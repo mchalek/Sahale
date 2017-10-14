@@ -5,6 +5,7 @@ import org.apache.http.impl.client.{ HttpClientBuilder, CloseableHttpClient }
 import org.apache.http.client.protocol.HttpClientContext
 import org.apache.http.client.methods.{ HttpPost, CloseableHttpResponse }
 import org.apache.http.entity.StringEntity
+import org.apache.http.HttpHost
 import java.nio.charset.StandardCharsets
 
 import org.apache.hadoop.mapred.{JobConf, JobClient}
@@ -124,6 +125,18 @@ class FlowTracker(val flow: Flow[_],
 
   // Each thread keeps its own HttpContext, independent from the shared HttpClient
   val httpContext = new HttpClientContext
+
+  // Determine the appropriate http host and use the HttpHost parser to check it.
+  // This has an advantage of making the HTTP scheme available in a systematic
+  // way so, for example, authentication-providing subclasses can make sure that
+  // we are using https
+  val httpHost = {
+    val hp = if(hostPort.trim.isEmpty) getDefaultHostPort else hostPort
+
+    HttpHost.create(hp.trim.stripSuffix("/"))
+  }
+
+  def sahaleUrl(suffix: String): String = s"${httpHost}/${suffix}"
 
   // so that we can compose a chain of multiple strategies, end users might
   // already have FlowStepStrategy implementations they need to apply later
@@ -263,6 +276,10 @@ class FlowTracker(val flow: Flow[_],
       pushReport(sahaleUrl(UPDATE_STEPS), steps.map { case(k, v) => v.send }.toJson.compactPrint)
   }
 
+  protected def setAdditionalHeaders(request: HttpPost) {
+    // Subclasses can override in order to set auth headers, for example
+  }
+
   def pushReport(uri: String, json: String): Int = {
     flow.getID match {
       case CheckIsCascadingFlowId(id) => {
@@ -273,7 +290,9 @@ class FlowTracker(val flow: Flow[_],
         request.setEntity(entity)
         request.setHeader("Content-Type", "application/json")
 
-        val response = getHttpClient.execute(request, httpContext)
+        setAdditionalHeaders(request)
+
+        val response = FlowTracker.getHttpClient.execute(request, httpContext)
         //logRequestResponse(url, response, json) // for debugging
 
         val code = response.getStatusLine.getStatusCode
@@ -298,14 +317,6 @@ class FlowTracker(val flow: Flow[_],
     LOG.info(s"Response status code: ${response.getStatusLine.getStatusCode}")
     LOG.info(s"Response status line: ${response.getStatusLine}")
     LOG.info(s"Response x-error-detail: ${response.getHeaders("x-error-detail")}")
-  }
-
-  def sahaleUrl(suffix: String = ""): String = {
-    val path = "/" + suffix
-    hostPort match {
-      case ""         => getDefaultHostPort + path
-      case hp: String => hp.trim + path
-    }
   }
 
   /////////////////// Utility functions for console progress bar /////////////////
