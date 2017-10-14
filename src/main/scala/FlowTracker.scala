@@ -1,10 +1,13 @@
 package com.etsy.sahale
 
-import org.apache.commons.httpclient.{HttpClient, MultiThreadedHttpConnectionManager, Header}
-import org.apache.commons.httpclient.cookie.CookiePolicy
-import org.apache.commons.httpclient.methods.{StringRequestEntity, PostMethod}
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager
+import org.apache.http.impl.client.{ HttpClientBuilder, CloseableHttpClient }
+import org.apache.http.client.protocol.HttpClientContext
+import org.apache.http.client.methods.{ HttpPost, CloseableHttpResponse }
+import org.apache.http.entity.StringEntity
+import java.nio.charset.StandardCharsets
+
 import org.apache.hadoop.mapred.{JobConf, JobClient}
-import org.apache.http.client.params.ClientPNames
 import org.apache.log4j.Logger
 
 import cascading.flow.{Flow, FlowStep, FlowStepStrategy}
@@ -20,13 +23,14 @@ import java.util.Properties
 
 import scala.collection.mutable
 import scala.collection.JavaConversions._
+import scala.util.{ Try, Success, Failure }
 
 import spray.json._
 import DefaultJsonProtocol._
 
 object FlowTracker {
   type AggFunc = () => Any
-  
+
   val PROPSFILE = "flow-tracker.properties"
 
   val NOT_LAUNCHED = "NOT_LAUNCHED"
@@ -46,7 +50,17 @@ object FlowTracker {
 
   val props = getTrackerProperties
 
-  private var client: HttpClient = getHttpClient
+  private var client: Option[CloseableHttpClient] = None
+
+  def getHttpClient = client.getOrElse {
+    val builder = HttpClientBuilder.create()
+    builder.setConnectionManager(new PoolingHttpClientConnectionManager)
+    // CookiePolicy.BROWSER_COMPATIBILITY is the default, we do not need to
+    // set it.  see:
+    val client = builder.build
+    this.client = Some(client)
+    client
+  }
 
   // master map of steps' hadoop counters to be aggregated and added to the flow data
   private val StepCounterAggregators = Map[String, (String, String)](
@@ -86,14 +100,6 @@ object FlowTracker {
     props.load(Thread.currentThread.getContextClassLoader.getResourceAsStream(PROPSFILE))
     props
   }
-
-  def getHttpClient = client match {
-    case hc: HttpClient if (null != hc) => hc
-    case _                                    =>
-      client = new HttpClient(new MultiThreadedHttpConnectionManager)
-      client.getParams().setParameter(ClientPNames.COOKIE_POLICY, CookiePolicy.BROWSER_COMPATIBILITY);
-      client
-  }
 }
 
 
@@ -115,6 +121,9 @@ class FlowTracker(val flow: Flow[_],
 
   // manages global job state for this run
   val flowStatus = new FlowStatus(flow, FlowTracker.props)
+
+  // Each thread keeps its own HttpContext, independent from the shared HttpClient
+  val httpContext = new HttpClientContext
 
   // so that we can compose a chain of multiple strategies, end users might
   // already have FlowStepStrategy implementations they need to apply later
@@ -259,25 +268,23 @@ class FlowTracker(val flow: Flow[_],
       case CheckIsCascadingFlowId(id) => {
         val url = uri + "/" + id + "?method=POST"
         // LOG.info("REQUEST URL TO API:" + url)
-        val request = new PostMethod(url)
-        val entity  = new StringRequestEntity(json, "application/json", "UTF-8")
-        try {
-          request.setRequestEntity(entity)
-          val code = getHttpClient.executeMethod(request)
-          //logRequestResponse(url, request, json) // for debugging
-          code
-        } finally {
-          if (null != request) {
-            try {
-              val asStream = request.getResponseBodyAsStream
-              if (asStream != null)
-                asStream.close()
-            } catch {
-              case e: IOException => LOG.warn("Could not close response stream for [" + url + "]", e)
-            }
-            request.releaseConnection
-          }
+        val request = new HttpPost(url)
+        val entity = new StringEntity(json, StandardCharsets.UTF_8)
+        request.setEntity(entity)
+        request.setHeader("Content-Type", "application/json")
+
+        val response = getHttpClient.execute(request, httpContext)
+        //logRequestResponse(url, response, json) // for debugging
+
+        val code = response.getStatusLine.getStatusCode
+
+        Try(response.close) match {
+          case Success(_) =>
+          case Failure(e) =>
+            LOG.warn("Could not close response stream for [" + url + "]", e)
         }
+
+        code
       }
       case _ => {
         LOG.warn(s"Bad FlowID: ${flow.getID}")
@@ -286,12 +293,11 @@ class FlowTracker(val flow: Flow[_],
     }
   }
 
-  def logRequestResponse(url: String, response: PostMethod, json: String): Unit = {
+  def logRequestResponse(url: String, response: CloseableHttpResponse, json: String): Unit = {
     LOG.info(s"Sent JSON to $url:\n${json}")
-    LOG.info(s"Response status code: ${response.getStatusCode}")
+    LOG.info(s"Response status code: ${response.getStatusLine.getStatusCode}")
     LOG.info(s"Response status line: ${response.getStatusLine}")
-    LOG.info(s"Repsonse status text: ${response.getStatusText}")
-    LOG.info(s"Response x-error-detail: ${response.getResponseHeader("x-error-detail")}")
+    LOG.info(s"Response x-error-detail: ${response.getHeaders("x-error-detail")}")
   }
 
   def sahaleUrl(suffix: String = ""): String = {
@@ -335,12 +341,14 @@ class FlowTracker(val flow: Flow[_],
     val tracker = FlowTracker.this
 
     override def run(): Unit = {
-      if (!tracker.runCompleted.get && FlowTracker.client != null) {
+      if (!tracker.runCompleted.get && FlowTracker.client.isDefined) {
         LOG.info("Performing final update from shutdown hook")
         tracker.updateSteps
         tracker.updateFlow
-        FlowTracker.client.getHttpConnectionManager.asInstanceOf[MultiThreadedHttpConnectionManager].shutdown
-        FlowTracker.client = null
+        // Connection manager shutdown is done by closing the CloseableHttpClient.  See:
+        // https://hc.apache.org/httpcomponents-client-ga/tutorial/html/connmgmt.html
+        FlowTracker.client.foreach(_.close)
+        FlowTracker.client = None
       }
     }
   }
